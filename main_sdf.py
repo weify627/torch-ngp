@@ -38,10 +38,12 @@ if __name__ == '__main__':
 
     else:
         from sdf.provider import SDFDataset
+        # from sdf.provider import SDF2Dataset as SDFDataset
         from loss import mape_loss
 
         train_dataset = SDFDataset(opt.path, size=100, num_samples=2**18)
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=16)
+        # train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
 
         valid_dataset = SDFDataset(opt.path, size=1, num_samples=2**18) # just a dummy
         valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1)
