@@ -2,6 +2,7 @@ import torch
 import argparse
 
 from sdf.utils import *
+from time import time
 
 if __name__ == '__main__':
 
@@ -14,6 +15,7 @@ if __name__ == '__main__':
     parser.add_argument('--fp16', action='store_true', help="use amp mixed precision training")
     parser.add_argument('--ff', action='store_true', help="use fully-fused MLP")
     parser.add_argument('--tcnn', action='store_true', help="use TCNN backend")
+    parser.add_argument('--save_grid', action='store_true', help="save grid")
 
     opt = parser.parse_args()
     print(opt)
@@ -31,18 +33,25 @@ if __name__ == '__main__':
 
     model = SDFNetwork(encoding="hashgrid")
     print(model)
+    # from sdf.provider import SDFDataset
+    from sdf.provider import SDF2Dataset as SDFDataset
+    train_dataset = SDFDataset(opt.path, size=100, num_samples=2**18)
 
     if opt.test:
-        trainer = Trainer('ngp', model, workspace=opt.workspace, fp16=opt.fp16, use_checkpoint='best', eval_interval=1)
-        trainer.save_mesh(os.path.join(opt.workspace, 'results', 'output.ply'), 1024)
+        trainer = Trainer('ngp', model, workspace=opt.workspace, fp16=opt.fp16, 
+               use_checkpoint='best', eval_interval=1,
+               data_transform=train_dataset.transform,
+               bounds_min=train_dataset.bounds_min,
+               bounds_max=train_dataset.bounds_max,
+               )
+        trainer.save_mesh(os.path.join(opt.workspace, 'results', 'output.ply'), 
+                1024, save_grid=opt.save_grid)
 
     else:
-        from sdf.provider import SDFDataset
-        # from sdf.provider import SDF2Dataset as SDFDataset
         from loss import mape_loss
 
-        train_dataset = SDFDataset(opt.path, size=100, num_samples=2**18)
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=16)
+        # train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0) #16)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=8)
         # train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
 
         valid_dataset = SDFDataset(opt.path, size=1, num_samples=2**18) # just a dummy
@@ -57,9 +66,15 @@ if __name__ == '__main__':
 
         scheduler = lambda optimizer: optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
-        trainer = Trainer('ngp', model, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, use_checkpoint='latest', eval_interval=1)
+        trainer = Trainer('ngp', model, workspace=opt.workspace, optimizer=optimizer,
+                criterion=criterion, ema_decay=0.95, fp16=opt.fp16, 
+                lr_scheduler=scheduler, use_checkpoint='latest', eval_interval=1,
+                data_transform=train_dataset.transform,
+                bounds_min=train_dataset.bounds_min,
+                bounds_max=train_dataset.bounds_max,
+                )
 
-        trainer.train(train_loader, valid_loader, 20)
+        trainer.train(train_loader, valid_loader, 30)
 
         # also test
         trainer.save_mesh(os.path.join(opt.workspace, 'results', 'output.ply'), 1024)

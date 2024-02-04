@@ -5,6 +5,7 @@ import random
 import warnings
 import tensorboardX
 
+import struct
 import numpy as np
 import pandas as pd
 
@@ -104,6 +105,9 @@ class Trainer(object):
                  use_checkpoint="latest", # which ckpt to use at init time
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
+                 data_transform=np.eye(4),
+                 bounds_min = torch.FloatTensor([-1, -1, -1]),
+                 bounds_max = torch.FloatTensor([1, 1, 1]),
                  ):
         
         self.name = name
@@ -125,6 +129,9 @@ class Trainer(object):
         self.scheduler_update_every_step = scheduler_update_every_step
         self.device = device if device is not None else torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
         self.console = Console()
+        self.data_transform = data_transform
+        self.bounds_min = bounds_min
+        self.bounds_max = bounds_max
 
         model.to(self.device)
         if self.world_size > 1:
@@ -233,11 +240,15 @@ class Trainer(object):
         pred = self.model(X)
         return pred        
 
-    def save_mesh(self, save_path=None, resolution=256):
+    def save_mesh(self, save_path=None, resolution=256, save_grid=False):
+        # resolution = 512 #256
 
         if save_path is None:
             save_path = os.path.join(self.workspace, 'validation', f'{self.name}_{self.epoch}.ply')
 
+        save_path = save_path[:-4] + f"-{resolution}" + save_path[-4:]
+        if save_grid:
+            save_path = save_path[:-4] + ".grd"
         self.log(f"==> Saving mesh to {save_path}")
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -249,15 +260,33 @@ class Trainer(object):
                     sdfs = self.model(pts)
             return sdfs
 
-        bounds_min = torch.FloatTensor([-1, -1, -1])
-        bounds_max = torch.FloatTensor([1, 1, 1])
+        # bounds_min = torch.FloatTensor([-1, -1, -1])
+        # bounds_max = torch.FloatTensor([1, 1, 1])
+        bounds_min = self.bounds_min
+        bounds_max = self.bounds_max
 
-        vertices, triangles = extract_geometry(bounds_min, bounds_max, resolution=resolution, threshold=0, query_func=query_func)
+        if save_grid:
+            u = extract_fields(bounds_min, bounds_max, resolution, query_func)
+            u = np.transpose(u, [2, 1, 0])
+            data_transform = self.data_transform * 1
+            # data_transform = np.eye(4)
+            data_transform[0, 0] *= 0.5 * (resolution - 1)
+            data_transform[1, 1] *= 0.5 * (resolution - 1)
+            data_transform[2, 2] *= 0.5 * (resolution - 1)
+            # data_transform[:3, 3] =(data_transform[0,0])  # for ori-ply
+            data_transform[:3, 3] = 0.5 * (resolution - 1) * (1 + self.data_transform[:3,3]) # *self.data_transform[0,0])
+            grid = Grid(resolution, u, data_transform)
+            grid.write_grid(save_path)
+            self.log(f"==> Finished saving grid to {save_path}.")
+        else:
+            vertices, triangles = extract_geometry(bounds_min, bounds_max, resolution=resolution, threshold=0, query_func=query_func) #, transform=self.data_transform, save_grid=save_grid)
+            vertices = np.concatenate([vertices, np.ones((vertices.shape[0], 1))], 1)
+            vertices = vertices @ np.linalg.inv(self.data_transform).T
 
-        mesh = trimesh.Trimesh(vertices, triangles, process=False) # important, process=True leads to seg fault...
-        mesh.export(save_path)
+            mesh = trimesh.Trimesh(vertices[:, :3], triangles, process=False) # important, process=True leads to seg fault...
+            mesh.export(save_path)
 
-        self.log(f"==> Finished saving mesh.")
+            self.log(f"==> Finished saving mesh.")
 
     ### ------------------------------
 
@@ -562,3 +591,47 @@ class Trainer(object):
 
         if 'scaler' in checkpoint_dict:
             self.scaler.load_state_dict(checkpoint_dict['scaler'])                
+
+
+class Grid:
+    # Assuming the rest of the Grid class implementation is as before
+
+    def __init__(self, grid_res, grid_values, transform=np.eye(4)):
+        self.grid_resolution = [grid_res] * 3
+        self.grid_size = np.prod(self.grid_resolution)
+        self.grid_values = grid_values
+        # self.world_to_grid_transform = np.linalg.inv(transform)
+        self.world_to_grid_transform = transform
+
+
+    def read_grid(self, file_path):
+        with open(file_path, 'rb') as fp:
+            # Read grid resolution
+            res = struct.unpack('iii', fp.read(12))
+            self.grid_resolution = list(res)
+            self.grid_size = np.prod(self.grid_resolution)
+            self.grid_values = np.zeros(self.grid_size, dtype=float)
+
+            # Read world_to_grid transformation
+            self.world_to_grid_transform = np.fromfile(fp, dtype=np.float32, count=16).reshape(4, 4)
+
+            # Read grid values
+            self.grid_values = np.fromfile(fp, dtype=np.float32, count=self.grid_size)
+
+            # Update transformation variables and other grid properties
+            # Implement as needed
+
+            return self.grid_size
+
+    def write_grid(self, file_path):
+        with open(file_path, 'wb') as fp:
+            # Write grid resolution
+            fp.write(struct.pack('iii', *self.grid_resolution))
+
+            # Write world_to_grid transformation
+            fp.write(self.world_to_grid_transform.astype(np.float32).tobytes())
+
+            # Write grid values
+            fp.write(self.grid_values.astype(np.float32).tobytes())
+
+            return self.grid_size
