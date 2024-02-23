@@ -63,6 +63,7 @@ def extract_fields(bound_min, bound_max, resolution, query_func):
                     pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [N, 3]
                     val = query_func(pts).reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [N, 1] --> [x, y, z]
                     u[xi * N: xi * N + len(xs), yi * N: yi * N + len(ys), zi * N: zi * N + len(zs)] = val
+                torch.cuda.empty_cache()
     return u
 
 
@@ -106,8 +107,9 @@ class Trainer(object):
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
                  data_transform=np.eye(4),
-                 bounds_min = torch.FloatTensor([-1, -1, -1]),
-                 bounds_max = torch.FloatTensor([1, 1, 1]),
+                 bounds_min=torch.FloatTensor([-1, -1, -1]),
+                 bounds_max=torch.FloatTensor([1, 1, 1]),
+                 path=None,
                  ):
         
         self.name = name
@@ -132,6 +134,7 @@ class Trainer(object):
         self.data_transform = data_transform
         self.bounds_min = bounds_min
         self.bounds_max = bounds_max
+        self.path = path
 
         model.to(self.device)
         if self.world_size > 1:
@@ -262,8 +265,8 @@ class Trainer(object):
 
         # bounds_min = torch.FloatTensor([-1, -1, -1])
         # bounds_max = torch.FloatTensor([1, 1, 1])
-        bounds_min = self.bounds_min
-        bounds_max = self.bounds_max
+        bounds_min = self.bounds_min * 1.0
+        bounds_max = self.bounds_max * 1.0
 
         if save_grid:
             u = extract_fields(bounds_min, bounds_max, resolution, query_func)
@@ -279,11 +282,45 @@ class Trainer(object):
             grid.write_grid(save_path)
             self.log(f"==> Finished saving grid to {save_path}.")
         else:
-            vertices, triangles = extract_geometry(bounds_min, bounds_max, resolution=resolution, threshold=0, query_func=query_func) #, transform=self.data_transform, save_grid=save_grid)
-            vertices = np.concatenate([vertices, np.ones((vertices.shape[0], 1))], 1)
-            vertices = vertices @ np.linalg.inv(self.data_transform).T
+            if resolution <= 2048:
+                vertices, triangles = extract_geometry(bounds_min, bounds_max, resolution=resolution, threshold=0, query_func=query_func) #, transform=self.data_transform, save_grid=save_grid)
+                vertices = np.concatenate([vertices, np.ones((vertices.shape[0], 1))], 1)
+                vertices = vertices @ np.linalg.inv(self.data_transform).T
+                mesh = trimesh.Trimesh(vertices[:, :3], triangles, process=False) # important, process=True leads to seg fault...
+            elif resolution == 4096:
+                # pause()
+                step = (bounds_max - bounds_min) / 2
+                bounds_max = bounds_min + step
+                meshes = []
+                for i in [1]: #range(2):
+                    if i == 1:
+                        bounds_min[0] += step[0]
+                        bounds_max[0] += step[0]
+                    for j in [1]: #range(2):
+                        if j == 1:
+                            bounds_min[1] += step[1]
+                            bounds_max[1] += step[1]
+                        else:
+                            bounds_min[1] = self.bounds_min[1] * 1.
+                            bounds_max[1] = self.bounds_min[1] + step[1]
+                        for k in [1]: #range(2):
+                            if k == 1:
+                                bounds_min[2] += step[2]
+                                bounds_max[2] += step[2]
+                            else:
+                                bounds_min[2] = self.bounds_min[2] * 1.
+                                bounds_max[2] = self.bounds_min[2] + step[2]
+                            # for j in range(2):
+                                # for k in range(2):
+                            vertices, triangles = extract_geometry(bounds_min, bounds_max, 
+                                    resolution=2048, threshold=0, query_func=query_func) #, transform=self.data_transform, save_grid=save_grid)
+                            vertices = np.concatenate([vertices, np.ones((vertices.shape[0], 1))], 1)
+                            vertices = vertices @ np.linalg.inv(self.data_transform).T
 
-            mesh = trimesh.Trimesh(vertices[:, :3], triangles, process=False) # important, process=True leads to seg fault...
+                            mesh = trimesh.Trimesh(vertices[:, :3], triangles, process=False) # important, process=True leads to seg fault...
+                            mesh.export(f"{save_path}-{i}-{j}-{k}.ply")
+                            meshes.append(mesh)
+                mesh = trimesh.util.concatenate(meshes)
             mesh.export(save_path)
 
             self.log(f"==> Finished saving mesh.")
@@ -296,6 +333,11 @@ class Trainer(object):
         
         for epoch in range(self.epoch + 1, max_epochs + 1):
             self.epoch = epoch
+            # if False:
+            if True and epoch % 1 == 0 and epoch > 1:
+                from sdf.provider import SDF3Dataset as SDFDataset
+                train_dataset = SDFDataset(self.path, size=305, num_samples=2**18, part=epoch-1)
+                train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=8)
 
             self.train_one_epoch(train_loader)
 

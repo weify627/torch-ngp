@@ -16,6 +16,7 @@ if __name__ == '__main__':
     parser.add_argument('--ff', action='store_true', help="use fully-fused MLP")
     parser.add_argument('--tcnn', action='store_true', help="use TCNN backend")
     parser.add_argument('--save_grid', action='store_true', help="save grid")
+    parser.add_argument('--marching_cubes_res', type=int, default=2048)
 
     opt = parser.parse_args()
     print(opt)
@@ -24,18 +25,21 @@ if __name__ == '__main__':
 
     if opt.ff:
         assert opt.fp16, "fully-fused mode must be used with fp16 mode"
-        from sdf.netowrk_ff import SDFNetwork
+        from sdf.network_ff import SDFNetwork
     elif opt.tcnn:
         assert opt.fp16, "tcnn mode must be used with fp16 mode"
         from sdf.network_tcnn import SDFNetwork        
     else:
-        from sdf.netowrk import SDFNetwork
+        from sdf.network import SDFNetwork
 
     model = SDFNetwork(encoding="hashgrid")
+    # model = SDFNetwork(encoding="hashgrid", num_layers=2, hidden_dim=256)
     print(model)
     # from sdf.provider import SDFDataset
-    from sdf.provider import SDF2Dataset as SDFDataset
-    train_dataset = SDFDataset(opt.path, size=100, num_samples=2**18)
+    # from sdf.provider import SDF2Dataset as SDFDataset
+    # train_dataset = SDFDataset(opt.path, size=100, num_samples=2**18)
+    from sdf.provider import SDF3Dataset as SDFDataset
+    train_dataset = SDFDataset(opt.path, size=305, num_samples=2**18)
 
     if opt.test:
         trainer = Trainer('ngp', model, workspace=opt.workspace, fp16=opt.fp16, 
@@ -64,7 +68,8 @@ if __name__ == '__main__':
             {'name': 'net', 'params': model.backbone.parameters(), 'weight_decay': 1e-6},
         ], lr=opt.lr, betas=(0.9, 0.99), eps=1e-15)
 
-        scheduler = lambda optimizer: optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+        # scheduler = lambda optimizer: optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+        scheduler = lambda optimizer: optim.lr_scheduler.StepLR(optimizer, step_size=12, gamma=0.1)
 
         trainer = Trainer('ngp', model, workspace=opt.workspace, optimizer=optimizer,
                 criterion=criterion, ema_decay=0.95, fp16=opt.fp16, 
@@ -72,9 +77,10 @@ if __name__ == '__main__':
                 data_transform=train_dataset.transform,
                 bounds_min=train_dataset.bounds_min,
                 bounds_max=train_dataset.bounds_max,
+                path = opt.path,
                 )
 
-        trainer.train(train_loader, valid_loader, 30)
+        trainer.train(train_loader, valid_loader, 20)
 
         # also test
-        trainer.save_mesh(os.path.join(opt.workspace, 'results', 'output.ply'), 1024)
+        trainer.save_mesh(os.path.join(opt.workspace, 'results', 'output.ply'), opt.marching_cubes_res)
