@@ -95,7 +95,182 @@ def write_sdf(filename, array):
         # Write the entire array to file in one go
         file.write(array.astype(np.float32).tobytes())
 
+# SDF dataset for 400M points
+class SDF5Dataset(Dataset):
+    def __init__(self, path, size=100, num_samples=2**18, clip_sdf=None, part=0, scene_list=[], dummy=False):
+        super().__init__()
+        self.path = path
+        if dummy:
+            self.mesh = trimesh.load(path, process=False)
+            vs = self.mesh.vertices
+            vmin = vs.min(0)
+            vmax = vs.max(0)
+            v_center = (vmin + vmax) / 2
+            v_scale = 2 / np.sqrt(np.sum((vmax - vmin) ** 2)) * 0.95
+            # vs = (vs - v_center[None, :]) * v_scale
+            self.v_center = v_center
+            self.v_scale = v_scale
+            self.transform = np.eye(4)
+            self.transform *= v_scale
+            self.transform[:3, 3] = -v_center * v_scale
+            self.transform[3, 3] = 1
+            vs = (vs - v_center[None, :]) * v_scale
+            self.bounds_min = 0
+            self.bounds_max = 0
+            self.pts = vs
+            return
+        self.num_samples = num_samples
+        assert self.num_samples % 8 == 0, "num_samples must be divisible by 8."
+        self.clip_sdf = clip_sdf
 
+        self.size = size
+        self.scene_list = scene_list
+        self.num_scenes = len(scene_list)
+        self.scenes = [SDF4Dataset(path, size, num_samples, clip_sdf, part, scene, dummy) for scene in scene_list]
+        self.transform = [scene.transform for scene in self.scenes]
+        self.bounds_min = [scene.bounds_min for scene in self.scenes]
+        self.bounds_max = [scene.bounds_max for scene in self.scenes]
+
+    def load_data(self, part=0):
+        for i in range(self.num_scenes):
+            self.scenes[i].load_data(part)
+
+    
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        results = []
+        for i in range(self.num_scenes):
+            i_results = self.scenes[i].__getitem__(idx)
+            results.append(i_results)
+
+        results = {
+            'sdfs': np.concatenate([result["sdfs"] for result in results], 0),
+            'points': np.stack([result["points"] for result in results], 1),
+        }
+
+
+        return results
+
+# SDF dataset for 400M points
+class SDF4Dataset(Dataset):
+    def __init__(self, path, size=100, num_samples=2**18, clip_sdf=None, part=0, scene="", dummy=False):
+        super().__init__()
+        self.path = f"{path}/{scene}/scans/rand_surf-40m-v9"
+        self.num_samples = num_samples
+        assert self.num_samples % 8 == 0, "num_samples must be divisible by 8."
+        self.clip_sdf = clip_sdf
+
+        self.size = size
+        self.load_data(part)
+        self.bounds_min = torch.FloatTensor(self.sdf_samples[..., :3].min(0))
+        self.bounds_max = torch.FloatTensor(self.sdf_samples[..., :3].max(0))
+        if dummy:
+            self.sdf_samples = self.sdf_samples[:2]
+
+    def load_data(self, part=0):
+
+        # load obj 
+        path = self.path
+        # if path is None:
+            # path = self.path
+        # else:
+            # self.path = path
+        path = f"{path}-{part}.ply"
+        self.mesh = trimesh.load(path, process=False)
+        sdf_onsurface = self.mesh.vertices
+        #TODO: check bbox vs off_surface
+        if True:
+            sdf_fname = path.replace("rand_surf", "near_surf")[:-3].replace("-cur1", "").replace("v9-", "exp5-") + "sdf"
+            sdf_offsurface = read_sdf(sdf_fname)
+            n_onsurface = sdf_onsurface.shape[0]
+            n_offsurface = sdf_offsurface.shape[0]
+            sdf_samples = np.zeros((n_onsurface + n_offsurface, 4))
+            sdf_samples[:n_onsurface, :3] = sdf_onsurface
+            sdf_samples[n_onsurface:] = sdf_offsurface
+
+        # normalize to [-1, 1] (different from instant-sdf where is [0, 1])
+        # vs = self.mesh.vertices
+        vs_full = sdf_samples[..., :3]
+        vs = sdf_samples[:n_onsurface, :3]
+        vmin = vs.min(0)
+        vmax = vs.max(0)
+        v_center = (vmin + vmax) / 2
+        v_scale = 2 / np.sqrt(np.sum((vmax - vmin) ** 2)) * 0.95
+        # vs = (vs - v_center[None, :]) * v_scale
+        if part == 0:
+            self.v_center = v_center
+            self.v_scale = v_scale
+            self.transform = np.eye(4)
+            self.transform *= v_scale
+            self.transform[:3, 3] = -v_center * v_scale
+            self.transform[3, 3] = 1
+        else:
+            v_center = self.v_center
+            v_scale = self.v_scale
+        vs_full = (vs_full - v_center[None, :]) * v_scale
+        # self.mesh.vertices = vs
+        self.sdf_samples = sdf_samples
+        # self.sdf_samples[..., :3] = vs
+        self.sdf_samples[..., :3] = vs_full
+        self.sdf_samples[..., 3] *= v_scale
+        self.n_sdf_samples = sdf_samples.shape[0]
+
+        choices = np.arange(self.n_sdf_samples)
+        if self.size == 1:
+            choices = choices[::100][:self.num_samples]
+        else:
+            np.random.shuffle(choices)
+        self.sdf_samples = self.sdf_samples[choices]
+
+        # print(f"[INFO] mesh: {self.mesh.vertices.shape} {self.mesh.faces.shape}")
+
+        
+        print(f"loaded {path}, {sdf_fname}")
+
+    
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+
+        # online sampling
+        # sdfs = np.zeros((self.num_samples, 1))
+        # # surface
+        # points_surface = self.mesh.sample(self.num_samples * 7 // 8)
+        # # perturb surface
+        # points_surface[self.num_samples // 2:] += 0.01 * np.random.randn(self.num_samples * 3 // 8, 3)
+        # # random
+        # points_uniform = np.random.rand(self.num_samples // 8, 3) * 2 - 1
+        # points = np.concatenate([points_surface, points_uniform], axis=0).astype(np.float32)
+
+        # sdfs[self.num_samples // 2:] = -self.sdf_fn(points[self.num_samples // 2:])[:,None].astype(np.float32)
+        if False:
+            start = np.random.choice(self.n_sdf_samples-1)
+            sdf_samples = np.concatenate([self.sdf_samples[start:], self.sdf_samples[:start]], 0)
+            interval = np.random.choice(self.n_sdf_samples // self.num_samples - 2) + 1
+            sampled = sdf_samples[::interval][:self.num_samples].astype(np.float32)
+        else:
+            sampled = self.sdf_samples[idx * self.num_samples: (idx + 1) * self.num_samples].astype(np.float32)
+        # sdfs = -sampled[..., 3:]
+        # TODO: check sign
+        sdfs = sampled[..., 3:]
+        points = sampled[..., :3]
+
+ 
+        # clip sdf
+        if self.clip_sdf is not None:
+            sdfs = sdfs.clip(-self.clip_sdf, self.clip_sdf)
+
+        results = {
+            'sdfs': sdfs,
+            'points': points,
+        }
+
+        #plot_pointcloud(points, sdfs)
+
+        return results
 # SDF dataset for 400M points
 class SDF3Dataset(Dataset):
     v_center = 0
@@ -112,7 +287,7 @@ class SDF3Dataset(Dataset):
         # else:
             # self.path = path
         path = f"{path}-{part}.ply"
-        self.mesh = trimesh.load(path, preprocess=False)
+        self.mesh = trimesh.load(path, process=False)
         sdf_onsurface = self.mesh.vertices
         #TODO: check bbox vs off_surface
         if True:
@@ -197,7 +372,6 @@ class SDF3Dataset(Dataset):
         # points = np.concatenate([points_surface, points_uniform], axis=0).astype(np.float32)
 
         # sdfs[self.num_samples // 2:] = -self.sdf_fn(points[self.num_samples // 2:])[:,None].astype(np.float32)
-        # pause()
         if False:
             start = np.random.choice(self.n_sdf_samples-1)
             sdf_samples = np.concatenate([self.sdf_samples[start:], self.sdf_samples[:start]], 0)
@@ -232,7 +406,7 @@ class SDF2Dataset(Dataset):
         # load obj 
         # self.mesh = trimesh.load(path, force='mesh')
         # sdf_fname = self.config.data / "rand_surf-4m.ply"
-        self.mesh = trimesh.load(path, preprocess=False)
+        self.mesh = trimesh.load(path, process=False)
         sdf_onsurface = self.mesh.vertices
         if True:
             # sdf_fname = f"{path.split('/rand')[0]}/near_surf-200k.sdf"

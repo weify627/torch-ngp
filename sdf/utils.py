@@ -82,7 +82,6 @@ def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
     return vertices, triangles
 
 
-
 class Trainer(object):
     def __init__(self, 
                  name, # name of this experiment
@@ -210,6 +209,13 @@ class Trainer(object):
                 self.log(f"[INFO] Loading {self.use_checkpoint} ...")
                 self.load_checkpoint(self.use_checkpoint)
 
+    def get_point_features(self, pts, encoder_id):
+        pts = pts.cuda()
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=self.fp16):
+                feats = self.model(pts[:, None], encoder_id, return_features=True)
+        return feats
+
     def __del__(self):
         if self.log_ptr: 
             self.log_ptr.close()
@@ -243,13 +249,15 @@ class Trainer(object):
         pred = self.model(X)
         return pred        
 
-    def save_mesh(self, save_path=None, resolution=256, save_grid=False):
+    def save_mesh(self, save_path=None, resolution=256, save_grid=False, encoder_id=None, scene=""):
         # resolution = 512 #256
+        if encoder_id is None:
+            encoder_id = 0
 
         if save_path is None:
-            save_path = os.path.join(self.workspace, 'validation', f'{self.name}_{self.epoch}.ply')
+            save_path = os.path.join(self.workspace, 'validation', f'{self.name}_{self.epoch}_{scene}.ply')
 
-        save_path = save_path[:-4] + f"-{resolution}" + save_path[-4:]
+        save_path = save_path[:-4] + f"-{scene}-{resolution}" + save_path[-4:]
         if save_grid:
             save_path = save_path[:-4] + ".grd"
         self.log(f"==> Saving mesh to {save_path}")
@@ -260,13 +268,13 @@ class Trainer(object):
             pts = pts.to(self.device)
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    sdfs = self.model(pts)
+                    sdfs = self.model(pts[:, None], encoder_id)
             return sdfs
 
         # bounds_min = torch.FloatTensor([-1, -1, -1])
         # bounds_max = torch.FloatTensor([1, 1, 1])
-        bounds_min = self.bounds_min * 1.0
-        bounds_max = self.bounds_max * 1.0
+        bounds_min = self.bounds_min[encoder_id] * 1.0
+        bounds_max = self.bounds_max[encoder_id] * 1.0
 
         if save_grid:
             u = extract_fields(bounds_min, bounds_max, resolution, query_func)
@@ -285,7 +293,7 @@ class Trainer(object):
             if resolution <= 2048:
                 vertices, triangles = extract_geometry(bounds_min, bounds_max, resolution=resolution, threshold=0, query_func=query_func) #, transform=self.data_transform, save_grid=save_grid)
                 vertices = np.concatenate([vertices, np.ones((vertices.shape[0], 1))], 1)
-                vertices = vertices @ np.linalg.inv(self.data_transform).T
+                vertices = vertices @ np.linalg.inv(self.data_transform[encoder_id]).T
                 mesh = trimesh.Trimesh(vertices[:, :3], triangles, process=False) # important, process=True leads to seg fault...
             elif resolution == 4096:
                 # pause()
@@ -335,9 +343,10 @@ class Trainer(object):
             self.epoch = epoch
             # if False:
             if True and epoch % 1 == 0 and epoch > 1:
-                from sdf.provider import SDF3Dataset as SDFDataset
-                train_dataset = SDFDataset(self.path, size=305, num_samples=2**18, part=epoch-1)
-                train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=8)
+                train_loader.dataset.load_data(part=epoch-1)
+                # from sdf.provider import SDF3Dataset as SDFDataset
+                # train_dataset = SDFDataset(self.path, size=305, num_samples=2**18, part=epoch-1)
+                # train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=8)
 
             self.train_one_epoch(train_loader)
 

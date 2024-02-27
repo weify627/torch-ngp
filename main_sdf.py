@@ -17,8 +17,16 @@ if __name__ == '__main__':
     parser.add_argument('--tcnn', action='store_true', help="use TCNN backend")
     parser.add_argument('--save_grid', action='store_true', help="save grid")
     parser.add_argument('--marching_cubes_res', type=int, default=2048)
+    parser.add_argument('--scene_list', type=list, default=["7"])
 
     opt = parser.parse_args()
+    # scene_list = ["c49a8c6cff"]
+    # scene_list = ["c49a8c6cff", "785e7504b9"]
+    scene_list = []
+    if "7" in opt.scene_list:
+        scene_list += ["785e7504b9"]
+    if "c" in opt.scene_list:
+        scene_list += ["c49a8c6cff"]
     print(opt)
 
     seed_everything(opt.seed)
@@ -31,15 +39,18 @@ if __name__ == '__main__':
         from sdf.network_tcnn import SDFNetwork        
     else:
         from sdf.network import SDFNetwork
+        # from sdf.network import SDF2Network as SDFNetwork
 
-    model = SDFNetwork(encoding="hashgrid")
-    # model = SDFNetwork(encoding="hashgrid", num_layers=2, hidden_dim=256)
+    model = SDFNetwork(encoding="hashgrid", n_encoders=len(scene_list))
+    # model = SDFNetwork(encoding="hashgrid", num_layers=2, hidden_dim=256, n_encoders=len(scene_list))
     print(model)
     # from sdf.provider import SDFDataset
     # from sdf.provider import SDF2Dataset as SDFDataset
     # train_dataset = SDFDataset(opt.path, size=100, num_samples=2**18)
-    from sdf.provider import SDF3Dataset as SDFDataset
-    train_dataset = SDFDataset(opt.path, size=305, num_samples=2**18)
+    from sdf.provider import SDF5Dataset as SDFDataset
+    train_dataset = SDFDataset(opt.path, size=305, num_samples=2**18, scene_list=scene_list, dummy=opt.test)
+    # train_dataset = SDFDataset(opt.path, size=305, num_samples=2**18, scene_list=scene_list, dummy=opt.test)
+    # train_dataset = SDFDataset(opt.path, size=1, num_samples=2**18, scene_list=scene_list)
 
     if opt.test:
         trainer = Trainer('ngp', model, workspace=opt.workspace, fp16=opt.fp16, 
@@ -47,7 +58,18 @@ if __name__ == '__main__':
                data_transform=train_dataset.transform,
                bounds_min=train_dataset.bounds_min,
                bounds_max=train_dataset.bounds_max,
+               path = opt.path,
                )
+        # path = 
+        # mesh = trimesh.load(path, preprocess=False)
+        pts = torch.from_numpy(train_dataset.pts).float()
+        trainer.model.encoders[0] = trainer.model.encoder
+        feats = trainer.get_point_features(pts, 0)
+        feats = feats.cpu().numpy().astype(np.float16)
+        pause()
+        with open(opt.path[:-4] + "1.npy", "wb") as f:
+            np.save(f, feats)
+        exit()
         trainer.save_mesh(os.path.join(opt.workspace, 'results', 'output.ply'), 
                 1024, save_grid=opt.save_grid)
 
@@ -58,16 +80,21 @@ if __name__ == '__main__':
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=8)
         # train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
 
-        valid_dataset = SDFDataset(opt.path, size=1, num_samples=2**18) # just a dummy
+        valid_dataset = SDFDataset(opt.path, size=1, num_samples=2**18, scene_list=scene_list) # just a dummy
         valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1)
 
         criterion = mape_loss # torch.nn.L1Loss()
-
         optimizer = lambda model: torch.optim.Adam([
-            {'name': 'encoding', 'params': model.encoder.parameters()},
-            {'name': 'net', 'params': model.backbone.parameters(), 'weight_decay': 1e-6},
+            {'name': 'encoding'+str(i), 'params': model.encoders[i].parameters()} for i in range(len(model.encoders))]+
+            [{'name': 'net', 'params': model.backbone.parameters(), 'weight_decay': 1e-6},
         ], lr=opt.lr, betas=(0.9, 0.99), eps=1e-15)
 
+        # optimizer = lambda model: torch.optim.Adam([
+            # {'name': 'encoding', 'params': model.encoder.parameters()},
+            # {'name': 'net', 'params': model.backbone.parameters(), 'weight_decay': 1e-6},
+        # ], lr=opt.lr, betas=(0.9, 0.99), eps=1e-15)
+
+        # scheduler = lambda optimizer: optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
         # scheduler = lambda optimizer: optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
         scheduler = lambda optimizer: optim.lr_scheduler.StepLR(optimizer, step_size=12, gamma=0.1)
 
@@ -83,4 +110,6 @@ if __name__ == '__main__':
         trainer.train(train_loader, valid_loader, 20)
 
         # also test
-        trainer.save_mesh(os.path.join(opt.workspace, 'results', 'output.ply'), opt.marching_cubes_res)
+        for i, scene in enumerate(scene_list): 
+            # if i==0: continue
+            trainer.save_mesh(os.path.join(opt.workspace, 'results', 'output.ply'), opt.marching_cubes_res, encoder_id=i, scene=scene)
