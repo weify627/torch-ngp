@@ -178,15 +178,15 @@ class SDF4Dataset(Dataset):
         # else:
             # self.path = path
         path = f"{path}-{part}.ply"
-        self.mesh = trimesh.load(path, process=False)
-        sdf_onsurface = self.mesh.vertices
+        mesh = trimesh.load(path, process=False)
+        sdf_onsurface = mesh.vertices.astype(np.float32)
         #TODO: check bbox vs off_surface
         if True:
             sdf_fname = path.replace("rand_surf", "near_surf")[:-3].replace("-cur1", "").replace("v9-", "exp5-") + "sdf"
             sdf_offsurface = read_sdf(sdf_fname)
             n_onsurface = sdf_onsurface.shape[0]
             n_offsurface = sdf_offsurface.shape[0]
-            sdf_samples = np.zeros((n_onsurface + n_offsurface, 4))
+            sdf_samples = np.zeros((n_onsurface + n_offsurface, 4)).astype(np.float32)
             sdf_samples[:n_onsurface, :3] = sdf_onsurface
             sdf_samples[n_onsurface:] = sdf_offsurface
 
@@ -224,9 +224,6 @@ class SDF4Dataset(Dataset):
             np.random.shuffle(choices)
         self.sdf_samples = self.sdf_samples[choices]
 
-        # print(f"[INFO] mesh: {self.mesh.vertices.shape} {self.mesh.faces.shape}")
-
-        
         print(f"loaded {path}, {sdf_fname}")
 
     
@@ -253,11 +250,12 @@ class SDF4Dataset(Dataset):
             sampled = sdf_samples[::interval][:self.num_samples].astype(np.float32)
         else:
             sampled = self.sdf_samples[idx * self.num_samples: (idx + 1) * self.num_samples].astype(np.float32)
+            # sampled = self.sdf_samples[:self.num_samples]
+            # self.sdf_samples = self.sdf_samples[self.num_samples:]
         # sdfs = -sampled[..., 3:]
         # TODO: check sign
         sdfs = sampled[..., 3:]
         points = sampled[..., :3]
-
  
         # clip sdf
         if self.clip_sdf is not None:
