@@ -109,6 +109,7 @@ class Trainer(object):
                  bounds_min=torch.FloatTensor([-1, -1, -1]),
                  bounds_max=torch.FloatTensor([1, 1, 1]),
                  path=None,
+                 use_color=False,
                  ):
         
         self.name = name
@@ -134,6 +135,8 @@ class Trainer(object):
         self.bounds_min = bounds_min
         self.bounds_max = bounds_max
         self.path = path
+        self.use_color = use_color
+        self.lw_rgb = 1.0 #10.0 #0.1  #1.0
 
         model.to(self.device)
         if self.world_size > 1:
@@ -144,6 +147,7 @@ class Trainer(object):
         if isinstance(criterion, nn.Module):
             criterion.to(self.device)
         self.criterion = criterion
+        self.rgb_loss = nn.L1Loss()
 
         if optimizer is None:
             self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=5e-4) # naive adam
@@ -235,11 +239,28 @@ class Trainer(object):
         # assert batch_size == 1
         X = data["points"][0] # [B, 3]
         y = data["sdfs"][0] # [B]
+        mask = None
+        if self.use_color:
+            mask = y[..., 1:].sum(-1) != 0
         
-        pred = self.model(X)
-        loss = self.criterion(pred, y)
-
-        return pred, y, loss
+        pred, pred_rgb = self.model(X, mask=mask)
+        loss_sdf = self.criterion(pred, y[..., :1])
+        if self.use_color:
+            # pred_rgb = self.model.get_rgb(
+            loss_rgb = self.rgb_loss(pred_rgb, y[..., 1:][mask])
+            # pause()
+            loss = loss_sdf + loss_rgb * self.lw_rgb
+            loss_dict = {
+                    "sdf": loss_sdf.item(),
+                    "rgb": loss_rgb.item()
+                    }
+        else:
+            loss_dict = {
+                    "sdf": loss_sdf.item(),
+                    "rgb": 0,
+                    }
+            loss = loss_sdf * 1.0
+        return pred, y, loss, loss_dict
 
     def eval_step(self, data):
         return self.train_step(data)
@@ -268,7 +289,7 @@ class Trainer(object):
             pts = pts.to(self.device)
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    sdfs = self.model(pts[:, None], encoder_id)
+                    sdfs, _ = self.model(pts[:, None], encoder_id)
             return sdfs
 
         # bounds_min = torch.FloatTensor([-1, -1, -1])
@@ -329,6 +350,15 @@ class Trainer(object):
                             mesh.export(f"{save_path}-{i}-{j}-{k}.ply")
                             meshes.append(mesh)
                 mesh = trimesh.util.concatenate(meshes)
+
+            if self.use_color:
+                pause()
+                pts = torch.from_numpy(vertices).to(self.device) @ torch.from_numpy(self.data_transform[encoder_id].T).to(self.device) 
+                pts = pts[:, :3].float()
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast(enabled=self.fp16):
+                        _, colors = self.model(pts[:, None], encoder_id)
+                mesh = trimesh.Trimesh(vertices[:, :3], triangles, vertex_colors=colors.cpu().numpy(),process=False)
             mesh.export(save_path)
 
             self.log(f"==> Finished saving mesh.")
@@ -422,7 +452,7 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
+                preds, truths, loss, loss_dict = self.train_step(data)
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -443,12 +473,16 @@ class Trainer(object):
                         
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
+                    for k, v in loss_dict.items():
+                        self.writer.add_scalar(f"train/{k}_loss", v, self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
 
                 if self.scheduler_update_every_step:
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    # pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    pbar.set_description(f"loss={loss_dict['sdf']:.4f}/{loss_dict['rgb']:.4f}({self.lw_rgb:.2f}) ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
                 else:
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
+                    # pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
+                    pbar.set_description(f"loss={loss_dict['sdf']:.4f}/{loss_dict['rgb']:.4f}({self.lw_rgb:.2f}) ({total_loss/self.local_step:.4f})")
                 pbar.update(loader.batch_size)
 
         average_loss = total_loss / self.local_step
@@ -497,7 +531,7 @@ class Trainer(object):
                     self.ema.copy_to()
             
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, truths, loss = self.eval_step(data)
+                    preds, truths, loss, loss_dict = self.eval_step(data)
 
                 if self.ema is not None:
                     self.ema.restore()
@@ -622,6 +656,8 @@ class Trainer(object):
         if self.ema is not None and 'ema' in checkpoint_dict:
             self.ema.load_state_dict(checkpoint_dict['ema'])
 
+        # self.model.encoders=self.model.encoders0
+        # return
         self.stats = checkpoint_dict['stats']
         self.epoch = checkpoint_dict['epoch']
         

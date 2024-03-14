@@ -16,8 +16,9 @@ if __name__ == '__main__':
     parser.add_argument('--ff', action='store_true', help="use fully-fused MLP")
     parser.add_argument('--tcnn', action='store_true', help="use TCNN backend")
     parser.add_argument('--save_grid', action='store_true', help="save grid")
-    parser.add_argument('--marching_cubes_res', type=int, default=2048)
+    parser.add_argument('--marching_cubes_res', type=int, default=1024) #2048)
     parser.add_argument('--scene_list', type=list, default=["7"])
+    parser.add_argument('--use_color', action='store_true', help="use color")
 
     opt = parser.parse_args()
     # scene_list = ["c49a8c6cff"]
@@ -41,14 +42,14 @@ if __name__ == '__main__':
         from sdf.network import SDFNetwork
         # from sdf.network import SDF2Network as SDFNetwork
 
-    model = SDFNetwork(encoding="hashgrid", n_encoders=len(scene_list))
+    model = SDFNetwork(encoding="hashgrid", n_encoders=len(scene_list), use_color=opt.use_color)
     # model = SDFNetwork(encoding="hashgrid", num_layers=2, hidden_dim=256, n_encoders=len(scene_list))
     print(model)
     # from sdf.provider import SDFDataset
     # from sdf.provider import SDF2Dataset as SDFDataset
     # train_dataset = SDFDataset(opt.path, size=100, num_samples=2**18)
     from sdf.provider import SDF5Dataset as SDFDataset
-    train_dataset = SDFDataset(opt.path, size=305, num_samples=2**18, scene_list=scene_list, dummy=opt.test)
+    train_dataset = SDFDataset(opt.path, size=305, num_samples=2**18, scene_list=scene_list, dummy=opt.test, use_color=opt.use_color)
     # train_dataset = SDFDataset(opt.path, size=305, num_samples=2**18, scene_list=scene_list, dummy=opt.test)
     # train_dataset = SDFDataset(opt.path, size=1, num_samples=2**18, scene_list=scene_list)
 
@@ -60,13 +61,11 @@ if __name__ == '__main__':
                bounds_max=train_dataset.bounds_max,
                path = opt.path,
                )
-        # path = 
         # mesh = trimesh.load(path, preprocess=False)
         pts = torch.from_numpy(train_dataset.pts).float()
-        trainer.model.encoders[0] = trainer.model.encoder
+        # trainer.model.encoders[0] = trainer.model.encoder
         feats = trainer.get_point_features(pts, 0)
         feats = feats.cpu().numpy().astype(np.float16)
-        pause()
         with open(opt.path[:-4] + "1.npy", "wb") as f:
             np.save(f, feats)
         exit()
@@ -80,14 +79,15 @@ if __name__ == '__main__':
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=8)
         # train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
 
-        valid_dataset = SDFDataset(opt.path, size=1, num_samples=2**18, scene_list=scene_list) # just a dummy
+        valid_dataset = SDFDataset(opt.path, size=1, num_samples=2**18, scene_list=scene_list, use_color=opt.use_color) # just a dummy
         valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1)
 
         criterion = mape_loss # torch.nn.L1Loss()
         optimizer = lambda model: torch.optim.Adam([
             {'name': 'encoding'+str(i), 'params': model.encoders[i].parameters()} for i in range(len(model.encoders))]+
-            [{'name': 'net', 'params': model.backbone.parameters(), 'weight_decay': 1e-6},
-        ], lr=opt.lr, betas=(0.9, 0.99), eps=1e-15)
+            [{'name': 'net', 'params': model.backbone.parameters(), 'weight_decay': 1e-6},]+ 
+            ([{'name': 'net', 'params': model.backbone_rgb.parameters(), 'weight_decay': 1e-6},] if opt.use_color else []), 
+            lr=opt.lr, betas=(0.9, 0.99), eps=1e-15)
 
         # optimizer = lambda model: torch.optim.Adam([
             # {'name': 'encoding', 'params': model.encoder.parameters()},
@@ -98,6 +98,7 @@ if __name__ == '__main__':
         # scheduler = lambda optimizer: optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
         scheduler = lambda optimizer: optim.lr_scheduler.StepLR(optimizer, step_size=12, gamma=0.1)
 
+                # criterion=criterion, ema_decay=None, fp16=opt.fp16, 
         trainer = Trainer('ngp', model, workspace=opt.workspace, optimizer=optimizer,
                 criterion=criterion, ema_decay=0.95, fp16=opt.fp16, 
                 lr_scheduler=scheduler, use_checkpoint='latest', eval_interval=1,
@@ -105,6 +106,7 @@ if __name__ == '__main__':
                 bounds_min=train_dataset.bounds_min,
                 bounds_max=train_dataset.bounds_max,
                 path = opt.path,
+                use_color = opt.use_color,
                 )
 
         trainer.train(train_loader, valid_loader, 20)

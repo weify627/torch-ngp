@@ -138,6 +138,7 @@ class SDFNetwork(nn.Module):
                  hidden_dim=64,
                  clip_sdf=None,
                  n_encoders=1,
+                 use_color=False,
                  ):
         super().__init__()
 
@@ -150,10 +151,11 @@ class SDFNetwork(nn.Module):
         # self.encoder, self.in_dim = get_encoder(encoding)
         self.encoders = []
         self.n_encoders = n_encoders
+        self.use_color = use_color
         self.max_res = 2048
         self.base_res = 16
         self.num_levels = 16
-        self.features_per_level = 4
+        self.features_per_level = 2 #4
         self.growth_factor = np.exp((np.log(self.max_res) - np.log(self.base_res)) / (self.num_levels - 1))
         for i in range(n_encoders):
             if True:
@@ -187,7 +189,8 @@ class SDFNetwork(nn.Module):
             self.encoders.append(encoder)
 
         self.encoders = nn.ModuleList(self.encoders)
-        self.encoder = self.encoders[0]
+        # self.encoder = self.encoders[0]
+        self.geofeat_dim = 64
         backbone = []
 
         for l in range(num_layers):
@@ -200,21 +203,45 @@ class SDFNetwork(nn.Module):
             
             if l == num_layers - 1:
                 out_dim = 1
+                if self.use_color:
+                    out_dim += self.geofeat_dim
             else:
                 out_dim = self.hidden_dim
             
             backbone.append(nn.Linear(in_dim, out_dim, bias=False))
 
         self.backbone = nn.ModuleList(backbone)
+        # pause()
+        if not self.use_color:
+            return
+        backbone = []
+
+        for l in range(num_layers):
+            if l == 0:
+                in_dim = 3 + self.geofeat_dim
+            elif l in self.skips:
+                in_dim = self.hidden_dim + self.in_dim
+            else:
+                in_dim = self.hidden_dim
+            
+            if l == num_layers - 1:
+                out_dim = 3
+            else:
+                out_dim = self.hidden_dim
+            
+            backbone.append(nn.Linear(in_dim, out_dim, bias=False))
+
+        self.backbone_rgb = nn.ModuleList(backbone)
+        self.sigmoid = torch.nn.Sigmoid()
 
     
-    def forward(self, x, encoder_id=None, return_features=False):
+    def forward(self, points, encoder_id=None, return_features=False, mask=None):
         # x: [B, 3]
         # x = torch.ones_like(x)[:90000]
         # x[:,0, 0] *= torch.arange(90000).cuda() / 90000 - 0.5
         # x[:,0, 1] *= -torch.arange(90000).cuda() / 90000
         # x[:,0, 2] *= 1-torch.arange(90000).cuda() / 90000
-
+        x = points
         if encoder_id is None:
             x = [self.encoders[i](x[:, i]) for i in range(self.n_encoders)] 
         else:
@@ -234,4 +261,21 @@ class SDFNetwork(nn.Module):
         if self.clip_sdf is not None:
             h = h.clamp(-self.clip_sdf, self.clip_sdf)
 
-        return h
+        # pause()
+        if not self.use_color:
+            return h, None
+        sdf, h_geo = torch.split(h, [1, self.geofeat_dim], dim=-1)
+        h = torch.cat([points.permute(1,0,2).reshape(-1, 3), h_geo], -1)
+        if mask is not None:
+            h = h[mask]
+        for l in range(self.num_layers):
+            if l in self.skips:
+                h = torch.cat([h, x], dim=-1)
+            h = self.backbone_rgb[l](h)
+            if l != self.num_layers - 1:
+                h = F.relu(h, inplace=True)
+            else:
+                h = self.sigmoid(h)
+
+        return sdf, h
+
